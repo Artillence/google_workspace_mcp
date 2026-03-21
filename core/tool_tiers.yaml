@@ -76,6 +76,9 @@ sheets:
     - create_spreadsheet
     - read_sheet_values
     - modify_sheet_values
+    - get_sheet_schema
+    - update_row
+    - append_row
   extended:
     - list_spreadsheets
     - get_spreadsheet_info

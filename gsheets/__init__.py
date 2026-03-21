@@ -11,6 +11,10 @@ from .sheets_tools import (
     modify_sheet_values,
     create_spreadsheet,
     create_sheet,
+    # New schema-based tools
+    get_sheet_schema,
+    update_row,
+    append_row,
 )
 
 __all__ = [
@@ -20,4 +24,7 @@ __all__ = [
     "modify_sheet_values",
     "create_spreadsheet",
     "create_sheet",
+    "get_sheet_schema",
+    "update_row",
+    "append_row",
 ]

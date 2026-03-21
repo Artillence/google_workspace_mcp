@@ -1195,7 +1195,251 @@ async def create_sheet(
         f"Successfully created sheet for {user_google_email}. Sheet ID: {sheet_id}"
     )
     return text_output
+from gsheets.sheets_helpers import _index_to_column, _quote_sheet_title_for_a1
 
+async def _fetch_sheet_headers(
+    service, spreadsheet_id: str, sheet_name: Optional[str], header_row: int
+) -> tuple[str, list[str]]:
+    """Helper to fetch column headers to map keys to column indices."""
+    if not sheet_name:
+        metadata = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(title))")
+            .execute
+        )
+        sheets = metadata.get("sheets",[])
+        if not sheets:
+            raise UserInputError("Spreadsheet has no sheets.")
+        sheet_name = sheets[0].get("properties", {}).get("title", "Sheet1")
+
+    safe_sheet_name = _quote_sheet_title_for_a1(sheet_name)
+    range_name = f"{safe_sheet_name}!A{header_row}:ZZ{header_row}"
+
+    result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=range_name)
+        .execute
+    )
+
+    values = result.get("values", [])
+    headers = values[0] if values else []
+    
+    # Strip trailing empty columns
+    while headers and str(headers[-1]).strip() == "":
+        headers.pop()
+
+    return sheet_name,[str(h) for h in headers]
+
+
+@server.tool()
+@handle_http_errors("get_sheet_schema", is_read_only=True, service_type="sheets")
+@require_google_service("sheets", "sheets_read")
+async def get_sheet_schema(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet_name: Optional[str] = None,
+    header_row: int = 1,
+) -> str:
+    """
+    Analyzes a spreadsheet to extract its structural schema.
+    Returns a JSON object mapping column header names to their properties (like column letter and index).
+    Use this before attempting to append or update rows with key-value data.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        sheet_name (Optional[str]): The sheet name to analyze. Defaults to the first sheet.
+        header_row (int): The row number containing the column headers. Defaults to 1.
+    """
+    logger.info(f"[get_sheet_schema] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}")
+
+    resolved_sheet_name, headers = await _fetch_sheet_headers(
+        service, spreadsheet_id, sheet_name, header_row
+    )
+
+    if not headers:
+        return f"No headers found in row {header_row} of sheet '{resolved_sheet_name}'."
+
+    schema = {
+        "spreadsheet_id": spreadsheet_id,
+        "sheet_name": resolved_sheet_name,
+        "header_row": header_row,
+        "columns": {}
+    }
+
+    for i, header_name in enumerate(headers):
+        clean_name = header_name.strip()
+        if clean_name:  # Ignore empty columns
+            col_letter = _index_to_column(i)
+            schema["columns"][clean_name] = {
+                "index": i,
+                "letter": col_letter
+            }
+
+    return json.dumps(schema, indent=2)
+
+
+@server.tool()
+@handle_http_errors("update_row", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def update_row(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    row_number: int,
+    row_data: Union[str, dict],
+    sheet_name: Optional[str] = None,
+    header_row: int = 1,
+) -> str:
+    """
+    Updates specific cells in an existing row using key-value pairs. Automatically maps
+    your JSON keys to the correct columns based on the sheet's header names.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        row_number (int): The row number to update (e.g., 2). Required.
+        row_data (Union[str, dict]): Key-value pairs matching header names to new cell values.
+        sheet_name (Optional[str]): The sheet name. Defaults to the first sheet.
+        header_row (int): The row number containing the column headers. Defaults to 1.
+    """
+    logger.info(f"[update_row] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}")
+
+    if isinstance(row_data, str):
+        try:
+            row_data = json.loads(row_data)
+        except json.JSONDecodeError as e:
+            raise UserInputError(f"Invalid JSON format for row_data: {e}")
+
+    if not isinstance(row_data, dict):
+        raise UserInputError("row_data must be a dictionary of key-value pairs.")
+
+    resolved_sheet_name, headers = await _fetch_sheet_headers(service, spreadsheet_id, sheet_name, header_row)
+    if not headers:
+        raise UserInputError(f"Cannot update: No headers found in row {header_row} of '{resolved_sheet_name}'.")
+
+    header_map = {h.strip(): i for i, h in enumerate(headers) if h.strip()}
+    safe_sheet_name = _quote_sheet_title_for_a1(resolved_sheet_name)
+
+    data = []
+    updated_keys, unknown_keys = [],[]
+
+    for key, value in row_data.items():
+        key_stripped = str(key).strip()
+        if key_stripped in header_map:
+            col_idx = header_map[key_stripped]
+            col_letter = _index_to_column(col_idx)
+            a1_range = f"{safe_sheet_name}!{col_letter}{row_number}"
+            data.append({
+                "range": a1_range,
+                "values": [[value]]
+            })
+            updated_keys.append(key_stripped)
+        else:
+            unknown_keys.append(key)
+
+    if not data:
+        raise UserInputError(f"No valid keys provided matching the sheet headers. Available headers: {list(header_map.keys())}")
+
+    body = {
+        "valueInputOption": "USER_ENTERED",
+        "data": data
+    }
+
+    await asyncio.to_thread(
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=body
+        ).execute
+    )
+
+    output = f"Successfully updated row {row_number} in '{resolved_sheet_name}' for {user_google_email}.\n"
+    output += f"Updated columns: {', '.join(updated_keys)}"
+    if unknown_keys:
+        output += f"\nWarning: Ignored unknown columns: {', '.join(unknown_keys)}"
+
+    return output
+
+
+@server.tool()
+@handle_http_errors("append_row", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def append_row(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    row_data: Union[str, dict],
+    sheet_name: Optional[str] = None,
+    header_row: int = 1,
+) -> str:
+    """
+    Appends a new row to the bottom of a sheet using key-value pairs. Automatically maps
+    your JSON keys to the correct columns based on the sheet's header names.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        row_data (Union[str, dict]): Key-value pairs matching header names to cell values.
+        sheet_name (Optional[str]): The sheet name. Defaults to the first sheet.
+        header_row (int): The row number containing the column headers. Defaults to 1.
+    """
+    logger.info(f"[append_row] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}")
+
+    if isinstance(row_data, str):
+        try:
+            row_data = json.loads(row_data)
+        except json.JSONDecodeError as e:
+            raise UserInputError(f"Invalid JSON format for row_data: {e}")
+
+    if not isinstance(row_data, dict):
+        raise UserInputError("row_data must be a dictionary of key-value pairs.")
+
+    resolved_sheet_name, headers = await _fetch_sheet_headers(service, spreadsheet_id, sheet_name, header_row)
+    if not headers:
+        raise UserInputError(f"Cannot append: No headers found in row {header_row} of '{resolved_sheet_name}'.")
+
+    header_map = {h.strip(): i for i, h in enumerate(headers) if h.strip()}
+    max_idx = max(header_map.values()) if header_map else -1
+    
+    # Pre-fill empty values up to the max index column found in the sheet headers
+    row_array = [""] * (max_idx + 1)
+    appended_keys, unknown_keys = [],[]
+
+    for key, value in row_data.items():
+        key_stripped = str(key).strip()
+        if key_stripped in header_map:
+            col_idx = header_map[key_stripped]
+            row_array[col_idx] = value
+            appended_keys.append(key_stripped)
+        else:
+            unknown_keys.append(key)
+
+    safe_sheet_name = _quote_sheet_title_for_a1(resolved_sheet_name)
+
+    body = {
+        "values": [row_array]
+    }
+
+    result = await asyncio.to_thread(
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=safe_sheet_name,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute
+    )
+
+    updated_range = result.get("updates", {}).get("updatedRange", "Unknown range")
+
+    output = f"Successfully appended 1 row to '{resolved_sheet_name}' (range: {updated_range}) for {user_google_email}.\n"
+    output += f"Mapped columns: {', '.join(appended_keys)}"
+    if unknown_keys:
+        output += f"\nWarning: Ignored unknown columns: {', '.join(unknown_keys)}"
+
+    return output
 
 # Create comment management tools for sheets
 _comment_tools = create_comment_tools("spreadsheet", "spreadsheet_id")
