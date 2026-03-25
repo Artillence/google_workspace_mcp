@@ -1427,7 +1427,7 @@ async def append_row(
             spreadsheetId=spreadsheet_id,
             range=safe_sheet_name,
             valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
+            insertDataOption="OVERWRITE", # INSERT_ROWS
             body=body
         ).execute
     )
